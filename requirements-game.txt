@@ -1,0 +1,17 @@
+# Game-side runtime dependencies for:
+#   python main.py --mode game-node
+#
+# Install inside the game machine environment:
+#   pip install -r requirements-game.txt
+
+numpy>=1.23
+opencv-python>=4.8
+keyboard>=0.13.5
+pywin32>=306
+psutil>=5.9
+mss>=9.0
+
+# Optional capture backend. The project now initializes DXCAM lazily because
+# some game/permission combinations can cause desktop-duplication errors.
+# Install only if you explicitly want to test method='dxcam'.
+dxcam>=0.0.5

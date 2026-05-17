@@ -1,0 +1,12 @@
+# AI-side runtime dependencies for:
+#   python main.py --mode ai-node
+#
+# Install inside the AI/training machine environment:
+#   pip install -r requirements-ai.txt
+#
+# For a specific CUDA build, install PyTorch from the official selector first:
+#   https://pytorch.org/get-started/locally/
+
+numpy>=1.23
+torch>=2.1
+tensorboard>=2.14
