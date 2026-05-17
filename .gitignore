@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+
+# Model checkpoints and training outputs
+*.pth
+*.pt
+*.ckpt
+runs_optimized*/
+events.out.tfevents.*
+
+# Local runtime/debug artifacts
+debug_images/
+capture_test/
+damage_stats.json
+
+# Local environment/editor noise
+.env
+.venv/
+venv/
+.idea/
+.vscode/
+*.log
