@@ -4,7 +4,7 @@ import threading
 import keyboard
 
 from actions import ActionController
-from config import GAME_CONFIG
+from config import GAME_CONFIG, REWARD_CONFIG
 from distributed_protocol import connect_with_retry, recv_message, send_message
 from game_interface import GameInterface
 from game_process_control import GameProcessFreezer
@@ -95,6 +95,10 @@ class GameNode:
             raise RuntimeError(f"Decision 返回异常: {reply}")
         return int(reply["action"]), float(reply.get("decision_ms", 0.0))
 
+    def _is_invalid_health_transition(self, prev_self, prev_boss, curr_self, curr_boss):
+        tolerance = REWARD_CONFIG.get('health_regen_tolerance', 1e-6)
+        return curr_boss > prev_boss + tolerance or curr_self > prev_self + tolerance
+
     def _advance_game(self):
         if self.freezer:
             self.freezer.run_one_frame()
@@ -113,7 +117,7 @@ class GameNode:
             time.sleep(0.2)
 
     def _resurrect_player(self, timeout=30.0):
-        print(">> 玩家死亡，开始复活流程：持续按回车直到玩家复活")
+        print(">> 玩家死亡，开始复活流程")
         self.action_controller.force_cancel_all()
         if self.freezer:
             self.freezer.resume()
@@ -180,8 +184,20 @@ class GameNode:
                     state = self.game.get_state_from_frame(raw)
                     continue
 
+                if self._is_invalid_health_transition(self_hp, boss_hp, next_self_hp, next_boss_hp):
+                    print(
+                        ">> 检测到血量回升垃圾帧，已跳过 | "
+                        f"boss {boss_hp:.4f}->{next_boss_hp:.4f}, "
+                        f"self {self_hp:.4f}->{next_self_hp:.4f}"
+                    )
+                    time.sleep(1.0 / max(self.target_fps, 1.0))
+                    continue
+
                 next_state = self.game.get_state_from_frame(next_raw)
                 reward = self.game.calculate_reward(self_hp, boss_hp, next_self_hp, next_boss_hp, action)
+                if reward is None:
+                    print(">> 奖励函数拒绝垃圾帧，已跳过")
+                    continue
                 done = next_self_hp <= 0 or next_boss_hp <= 0
 
                 self._send_transition({

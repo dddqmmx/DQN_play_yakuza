@@ -100,6 +100,7 @@ REWARD_CONFIG = {
     'low_health_penalty': -2.0,          # 降低低血量惩罚
     'low_health_threshold': 0.15,
     'boss_defeat_reward': 30.0,          # 击杀作为结算特别加分，主要分数仍来自累计伤害
+    'health_regen_tolerance': 1e-6,      # 血量不应回升；超过该容差视为垃圾帧并跳过
     'special_bonus_cap_without_damage': 0.05, # 未造成伤害时，其他加分的单步上限
     'special_bonus_damage_ratio': 0.15,  # 造成伤害时，其他加分最多约为伤害分的一小部分
     'special_bonus_step_cap': 1.0,       # 其他加分的绝对单步上限
@@ -112,7 +113,8 @@ REWARD_CONFIG = {
     'grab_action_bonus': 0.0,           # 抓取本身不加分，只让命中伤害说话
     'grab_frequency_threshold': 100,     # 增加不抓取的容忍时间
     'grab_absence_penalty_base': -0.01,  # 大幅降低不抓取惩罚，防止其主导奖励
-    'grab_combo_bonus': 0.02,            # 抓取连招只给极小特别加分
+    'grab_success_bonus': 0.02,          # 抓取成功造成伤害才给极小特别加分
+    'grab_combo_bonus': 0.0,             # 抓取连招不再额外加分，避免误导
     
     # 引导奖励
     'attack_action_bonus': 0.005,        # 尝试攻击只给极小引导分

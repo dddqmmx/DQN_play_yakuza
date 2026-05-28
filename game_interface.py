@@ -152,6 +152,10 @@ class GameInterface:
         if dt > 1.0: dt = 1.0 
         self.last_step_time = now
 
+        regen_tolerance = REWARD_CONFIG.get('health_regen_tolerance', 1e-6)
+        if curr_boss > prev_boss + regen_tolerance or curr_self > prev_self + regen_tolerance:
+            return None
+
         damage_dealt = max(0.0, prev_boss - curr_boss)
         damage_taken = max(0.0, prev_self - curr_self)
         
@@ -162,9 +166,10 @@ class GameInterface:
         penalty = time_penalty_per_sec * dt
 
         # 1. 动作倾向分析
-        is_attack = action in [1, 2, 9]
-        is_passive = action in [0, 4, 5, 6, 8] # 无动作, 后退, 左右, 防御
+        is_attack = action in [1, 2]
         is_grab = (action == 9)
+        is_aggressive = is_attack or is_grab
+        is_passive = action in [0, 4, 5, 6, 8] # 无动作, 后退, 左右, 防御
 
         # 2. 基础攻击动作奖励 (鼓励尝试进攻)
         if is_attack:
@@ -173,7 +178,6 @@ class GameInterface:
         # 2.1 抓取动作引导
         if is_grab:
             self.time_since_last_grab = 0.0
-            special_bonus += REWARD_CONFIG.get('grab_action_bonus', 0.1)
         else:
             self.time_since_last_grab += dt
             # 假设之前阈值为 100步 (~5秒)
@@ -187,6 +191,8 @@ class GameInterface:
         # 3. 伤害奖励与连击逻辑
         if damage_dealt > 0:
             self.passive_time = 0.0 # 造成伤害重置消极时间
+            if is_grab:
+                special_bonus += REWARD_CONFIG.get('grab_success_bonus', 0.02)
             
             if REWARD_CONFIG['enable_combo_reward']:
                 if now - self.last_damage_time <= REWARD_CONFIG['combo_timeout']:
@@ -207,7 +213,7 @@ class GameInterface:
                 self.last_damage_time = now
                 if self.combo_streak > 1:
                     special_bonus += self.combo_streak * REWARD_CONFIG['combo_base_reward']
-        elif is_attack:
+        elif is_aggressive:
             # 攻击但没打中，也重置消极计数
             self.passive_time = 0.0
         elif not is_passive:
