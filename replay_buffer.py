@@ -122,3 +122,40 @@ class PrioritizedReplayBuffer:
 
     def __len__(self):
         return self.tree.n_entries
+
+
+class UniformReplayBuffer:
+    """
+    均匀采样的环形 buffer，给计划一致性 loss 用。
+
+    为什么不复用上面的 PER：槽位一致性是**回归**（把 Q_j(s) 拟合到
+    Q_{j-1}^target(s')），没有 TD error 可言，优先级无从谈起；而且它必须吃
+    **1 步** transition —— PER 里存的是 n-step 聚合过的，那里的 s' 已经是 t+n 了，
+    对不上"下一帧的计划往前挪一格"这个关系。
+    """
+
+    def __init__(self, capacity):
+        self.capacity = int(capacity)
+        self.data = [None] * self.capacity
+        self.write = 0
+        self.n_entries = 0
+        self.lock = threading.Lock()
+
+    def add(self, transition):
+        with self.lock:
+            self.data[self.write] = transition
+            self.write = (self.write + 1) % self.capacity
+            self.n_entries = min(self.n_entries + 1, self.capacity)
+
+    def sample(self, batch_size):
+        with self.lock:
+            if self.n_entries == 0:
+                return []
+            idxs = np.random.randint(0, self.n_entries, size=batch_size)
+            return [self.data[i] for i in idxs]
+
+    def is_ready(self, batch_size):
+        return self.n_entries >= batch_size
+
+    def __len__(self):
+        return self.n_entries

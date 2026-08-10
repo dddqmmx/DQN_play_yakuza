@@ -1,14 +1,22 @@
 import time
-import keyboard
 import threading
 import queue
 import json
 import os
 import numpy as np
-from config import TRAINING_CONFIG, REWARD_CONFIG, GAME_CONFIG
+from config import CTM_PROFILES, MODEL_PROFILES, TRAINING_CONFIG, REWARD_CONFIG, GAME_CONFIG
 from actions import ActionController
 from game_interface import GameInterface
-from dqn_agent import DQNAgent
+from backends import is_windows, load_platform
+
+_hotkey_backend = None
+
+
+def _add_hotkey(key, callback):
+    global _hotkey_backend
+    if _hotkey_backend is None:
+        _hotkey_backend = load_platform().hotkeys
+    _hotkey_backend.add_hotkey(key, callback)
 
 
 class DamageStats:
@@ -87,13 +95,15 @@ class DamageStats:
 
 
 class TrainingManager:
-    """极速版训练管理器：支持异步训练与优化截屏"""
+    """极速版训练管理器：支持异步训练与优化截屏（单进程 legacy 路径）"""
 
-    def __init__(self):
-        self.action_controller = ActionController(max_combo_slots=GAME_CONFIG.get('max_combo_slots', 5))
+    def __init__(self, arch="ctm", model_profile="large"):
+        self.arch = arch if arch in ("ctm", "pro") else "ctm"
+        self.action_controller = ActionController()
         self.game = GameInterface()
-        self.agent = DQNAgent(self.action_controller.get_action_count())
+        self.agent = self._create_agent(model_profile)
         self.damage_stats = DamageStats()
+        self.plan_interrupt_damage = float(GAME_CONFIG.get("plan_interrupt_damage", 0.01))
 
         # 状态控制
         self.is_paused = True
@@ -111,16 +121,44 @@ class TrainingManager:
 
         self._setup_hotkeys()
 
+    def _create_agent(self, model_profile):
+        num_actions = self.action_controller.get_action_count()
+        if self.arch == "ctm":
+            from ctm_agent import CTMPlannerAgent
+            profile = model_profile if model_profile in CTM_PROFILES else "large"
+            return CTMPlannerAgent(num_actions, network_config=CTM_PROFILES[profile])
+        from dqn_agent import DQNAgent
+        profile = model_profile if model_profile in MODEL_PROFILES else "large"
+        return DQNAgent(num_actions, network_config=MODEL_PROFILES[profile])
+
+    def _select_plan(self, state, boss_hp, self_hp, hidden):
+        """统一成计划形式；旧 ProNet 退化成单步计划。"""
+        if hasattr(self.agent, "select_plan"):
+            plan, commit, confidence = self.agent.select_plan(state, boss_hp, self_hp)
+            return plan, commit, confidence, hidden
+        if self.agent.use_recurrent:
+            action, hidden = self.agent.select_action(state, boss_hp, self_hp, hidden)
+        else:
+            action = self.agent.select_action(state, boss_hp, self_hp)
+        return [int(action)], 1, 0.0, hidden
+
     def _setup_hotkeys(self):
-        keyboard.add_hotkey('f5', self._save_checkpoint)
-        keyboard.add_hotkey('0', self._toggle_pause)
-        keyboard.add_hotkey('f9', self._stop_training)
-        print("\n" + "="*30)
-        print("控制快捷键:")
-        print(" [0] - 开始/暂停训练")
-        print(" [F5] - 手动保存模型")
-        print(" [F9] - 安全退出程序")
-        print("="*30 + "\n")
+        _add_hotkey('f5', self._save_checkpoint)
+        _add_hotkey('0', self._toggle_pause)
+        _add_hotkey('f9', self._stop_training)
+        print("\n" + "=" * 42)
+        if is_windows():
+            print("控制快捷键:")
+            print(" [0]  - 开始/暂停训练")
+            print(" [F5] - 手动保存模型")
+            print(" [F9] - 安全退出程序")
+        else:
+            print("Linux 控制台指令（输入后回车）:")
+            print("  0 / start / pause   开始或暂停训练")
+            print("  f5 / save           手动保存模型")
+            print("  f9 / quit / exit    安全退出")
+            print("  help                显示帮助")
+        print("=" * 42 + "\n")
 
     def _async_train_worker(self):
         """后台训练线程"""
@@ -209,65 +247,81 @@ class TrainingManager:
         episode_start_time = time.time()
 
         while self.is_running and not self.is_paused:
-            step_start = time.time()
-            
-            # 1. 决策
-            if self.agent.use_recurrent:
-                action, hidden = self.agent.select_action(state, boss_hp, self_hp, hidden)
-            else:
-                action = self.agent.select_action(state, boss_hp, self_hp)
-                
-            # 2. 执行
-            self.action_controller.take_action(action)
+            # 1. 规划：一次拿到一整条动作序列，以及本次要提交几步
+            plan, commit, confidence, hidden = self._select_plan(state, boss_hp, self_hp, hidden)
 
-            # 3. 动态等待
-            wait_time = 0.02 if action == 0 else 0.04
-            time.sleep(wait_time)
+            done = False
+            next_boss_hp = boss_hp
+            for slot in range(commit):
+                action = plan[slot]
 
-            # 4. 获取新状态 (关键：只截一次屏)
-            next_boss_hp, next_self_hp, _, _, next_raw = self.game.check_game_state()
-            if next_boss_hp is None: break
-                
-            next_state = self.game.get_state_from_frame(next_raw)
+                # 2. 执行
+                self.action_controller.take_action(action)
 
-            # 5. 计算奖励
-            reward = self.game.calculate_reward(self_hp, boss_hp, next_self_hp, next_boss_hp, action)
-            done = next_self_hp <= 0 or next_boss_hp <= 0
-            
-            # 5.1 表现评估 (仅在回合结束时计算一次)
-            if done:
-                episode_duration = time.time() - episode_start_time
-                total_damage = max(0, boss_hp_start - next_boss_hp)
-                perf_reward, msg = self.damage_stats.update_and_evaluate(total_damage, episode_duration)
-                if msg: print(f">> {msg}")
-                reward += perf_reward
+                # 3. 动态等待
+                time.sleep(0.02 if action == 0 else 0.04)
 
-            # 5.2 连招发现与统计
-            self.action_controller.combo_manager.discover_combo(reward)
-            
-            # 6. 存储经验
-            self.agent.store_transition(
-                state, boss_hp, self_hp, action,
-                reward, next_state, next_boss_hp, next_self_hp, done
-            )
+                # 4. 获取新状态 (关键：只截一次屏)
+                next_boss_hp, next_self_hp, _, _, next_raw = self.game.check_game_state()
+                if next_boss_hp is None or next_self_hp is None:
+                    # 任一条血条读不到都不能算数：None 当 0 会误判成回合结束
+                    next_boss_hp = None
+                    done = False
+                    break
 
-            # 7. 更新当前状态
-            state = next_state
-            boss_hp = next_boss_hp
-            self_hp = next_self_hp
-            episode_reward += reward
-            step_count += 1
+                next_state = self.game.get_state_from_frame(next_raw)
 
-            # 性能统计
-            step_duration = time.time() - step_start
-            fps = 1.0 / step_duration if step_duration > 0 else 0
-            
-            if step_count % 50 == 0:
-                print(f"Step: {step_count} | Reward: {episode_reward:.2f} | FPS: {fps:.1f} | Epsilon: {self.agent.epsilon:.4f}")
+                # 5. 计算奖励
+                reward = self.game.calculate_reward(
+                    self_hp, boss_hp, next_self_hp, next_boss_hp, action
+                )
+                if reward is None:
+                    break
+                done = next_self_hp <= 0 or next_boss_hp <= 0
+
+                # 5.1 表现评估 (仅在回合结束时计算一次)
+                if done:
+                    episode_duration = time.time() - episode_start_time
+                    total_damage = max(0, boss_hp_start - next_boss_hp)
+                    perf_reward, msg = self.damage_stats.update_and_evaluate(
+                        total_damage, episode_duration
+                    )
+                    if msg:
+                        print(f">> {msg}")
+                    reward += perf_reward
+
+                # 6. 存储经验
+                self.agent.store_transition(
+                    state, boss_hp, self_hp, action,
+                    reward, next_state, next_boss_hp, next_self_hp, done
+                )
+
+                # 7. 更新当前状态
+                took = max(0.0, self_hp - next_self_hp)
+                state = next_state
+                boss_hp = next_boss_hp
+                self_hp = next_self_hp
+                episode_reward += reward
+                step_count += 1
+
+                if step_count % 50 == 0:
+                    print(
+                        f"Step: {step_count} | Reward: {episode_reward:.2f} | "
+                        f"计划{plan} 提交{commit} 决断度{confidence:.2f}"
+                    )
+
+                if done:
+                    break
+                # 挨打了：计划的前提没了，丢弃剩余步数重新规划
+                if took > self.plan_interrupt_damage and slot + 1 < commit:
+                    break
+
+            if next_boss_hp is None:
+                break
 
             if done:
                 print(f">>> 回合结束 | 总奖励: {episode_reward:.2f} | 总步数: {step_count}")
-                self.action_controller.force_cancel_all() # 确保释放所有长按键
+                self.action_controller.force_cancel_all()  # 确保释放所有长按键
                 break
 
         return episode_reward, step_count
@@ -313,15 +367,21 @@ class TrainingManager:
             self.agent.close()
 
     def debug_mode(self):
-        """调试模式"""
-        print(">> 进入调试模式，按 ESC 退出")
-        while not keyboard.is_pressed('esc'):
-            boss_hp, self_hp, _, _, raw = self.game.check_game_state()
-            if raw is not None:
-                self.game.debug_health_regions(raw)
-                if boss_hp is not None:
-                    print(f"\r[DEBUG] Boss HP: {boss_hp:.3f} | Player HP: {self_hp:.3f} | 窗口正常", end="")
-            else:
-                print("\r[DEBUG] 无法获取游戏窗口！", end="")
-            time.sleep(0.05)
+        """调试模式：显示血条框；按 c 自动定位，Ctrl+C 退出"""
+        print(">> 进入调试模式 | 终端输入 c+回车=自动定位，Ctrl+C 退出")
+        try:
+            while self.is_running:
+                boss_hp, self_hp, _, _, raw = self.game.check_game_state(auto_locate=False)
+                if raw is not None:
+                    self.game.debug_health_regions(raw, show=True)
+                    print(
+                        f"\r[DEBUG] Boss={boss_hp} Player={self_hp} "
+                        f"frame={raw.shape[1]}x{raw.shape[0]} loc={self.game.locations}",
+                        end="",
+                    )
+                else:
+                    print("\r[DEBUG] 无法获取游戏窗口！", end="")
+                time.sleep(0.05)
+        except KeyboardInterrupt:
+            pass
         print("\n>> 退出调试模式")

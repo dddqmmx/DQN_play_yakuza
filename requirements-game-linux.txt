@@ -1,0 +1,15 @@
+# Linux / Proton / Wayland (niri 等) game-node 依赖
+#   pip install -r requirements-game-linux.txt
+#
+# 系统包 (Arch 示例):
+#   pacman -S python-evdev gstreamer gst-plugins-base gst-plugin-pipewire
+#             python-gobject python-dbus xdg-desktop-portal xdg-desktop-portal-gnome
+#   # uinput 权限: 用户加入 input 组，或:
+#   #   echo 'KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"' \
+#   #     | sudo tee /etc/udev/rules.d/99-uinput.rules
+
+numpy>=1.23
+opencv-python>=4.8
+psutil>=5.9
+evdev>=1.6
+mss>=9.0

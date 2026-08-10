@@ -154,9 +154,10 @@ class OptimizedNet(nn.Module):
         self.advantage_head = linear_layer(head_input_dim, num_actions)
 
     def forward(self, x, boss_health, self_health, hidden=None):
-        # x shape: (batch, 4, 160, 160)
+        # 状态以 uint8 (0~255) 存/传，归一化在这里做（见 core/observation.preprocess_frame）
+        x = x.float() / 255.0 if x.dtype == torch.uint8 else x.float()
         batch_size = x.size(0)
-        
+
         # 转换为 3D 卷积输入: (batch, 1, time=4, h, w)
         x_3d = x.unsqueeze(1)
         feat_3d = self.conv3d(x_3d) # (batch, 32, 4, 40, 40)
@@ -253,6 +254,8 @@ class ProNet(nn.Module):
         return F.interpolate(x, size=(H, W), mode='bilinear', align_corners=False) + y
 
     def forward(self, x, boss_health, self_health, hidden=None):
+        # 状态以 uint8 (0~255) 存/传，归一化在这里做（见 core/observation.preprocess_frame）
+        x = x.float() / 255.0 if x.dtype == torch.uint8 else x.float()
         batch_size = x.size(0)
         x_3d = x.unsqueeze(1)
         feat_3d = self.conv3d(x_3d)

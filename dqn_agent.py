@@ -63,6 +63,7 @@ class DQNAgent:
         self.tau = TRAINING_CONFIG.get('tau', 0.005)
         self.reward_scale = TRAINING_CONFIG.get('reward_scale', 0.1)
         self.steps = 0
+        self.transitions_seen = 0   # 供 decision_node 的 replay ratio 限速用
         self.writer = SummaryWriter(log_dir or FILE_PATHS['tensorboard_logs'])
         
         # 线程锁
@@ -93,7 +94,7 @@ class DQNAgent:
         if not self.use_noisy and random.random() < self.epsilon:
             if self.use_recurrent:
                 with torch.no_grad():
-                    state_t = torch.as_tensor(state, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+                    state_t = torch.as_tensor(state, dtype=torch.uint8, device=DEVICE).unsqueeze(0)
                     boss_t = torch.as_tensor([boss_health], dtype=torch.float32, device=DEVICE).unsqueeze(0)
                     self_t = torch.as_tensor([self_health], dtype=torch.float32, device=DEVICE).unsqueeze(0)
                     with self.net_lock:
@@ -102,7 +103,7 @@ class DQNAgent:
             return random.randint(0, self.num_actions - 1)
 
         with torch.no_grad():
-            state_t = torch.as_tensor(state, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+            state_t = torch.as_tensor(state, dtype=torch.uint8, device=DEVICE).unsqueeze(0)
             boss_t = torch.as_tensor([boss_health], dtype=torch.float32, device=DEVICE).unsqueeze(0)
             self_t = torch.as_tensor([self_health], dtype=torch.float32, device=DEVICE).unsqueeze(0)
 
@@ -130,6 +131,7 @@ class DQNAgent:
             next_boss_health, next_self_health, done
         )
         self.n_step_buffer.append(transition)
+        self.transitions_seen += 1
         
         if len(self.n_step_buffer) == self.n_step:
             reward_sum = 0
@@ -154,12 +156,12 @@ class DQNAgent:
         transitions, indices, weights = self.memory.sample(self.batch_size)
         batch = Transition(*zip(*transitions))
 
-        state = torch.as_tensor(np.array(batch.state), dtype=torch.float32, device=DEVICE)
+        state = torch.as_tensor(np.array(batch.state), dtype=torch.uint8, device=DEVICE)
         boss_hp = torch.as_tensor(batch.boss_health, dtype=torch.float32, device=DEVICE).unsqueeze(1)
         self_hp = torch.as_tensor(batch.self_health, dtype=torch.float32, device=DEVICE).unsqueeze(1)
         action = torch.as_tensor(batch.action, dtype=torch.long, device=DEVICE).unsqueeze(1)
         reward = torch.as_tensor(batch.reward, dtype=torch.float32, device=DEVICE) * self.reward_scale
-        next_state = torch.as_tensor(np.array(batch.next_state), dtype=torch.float32, device=DEVICE)
+        next_state = torch.as_tensor(np.array(batch.next_state), dtype=torch.uint8, device=DEVICE)
         next_boss = torch.as_tensor(batch.next_boss_health, dtype=torch.float32, device=DEVICE).unsqueeze(1)
         next_self = torch.as_tensor(batch.next_self_health, dtype=torch.float32, device=DEVICE).unsqueeze(1)
         done = torch.as_tensor(batch.done, dtype=torch.float32, device=DEVICE)
@@ -263,7 +265,11 @@ class DQNAgent:
                 return False
                 
             checkpoint = torch.load(filename, map_location=DEVICE, weights_only=False)
-            
+
+            if checkpoint.get('arch') == 'ctm':
+                print(f">> {filename} 是 CTM 计划模型的权重，ProNet 无法加载。请用 --arch ctm。")
+                return False
+
             # 动作空间兼容性处理
             saved_actions = checkpoint.get('num_actions', 13)
             if saved_actions != self.num_actions:

@@ -10,8 +10,12 @@ events.out.tfevents.*
 
 # Local runtime/debug artifacts
 debug_images/
+debug_auto_locate.png
 capture_test/
 damage_stats.json
+samples/
+samples_heat/
+samples_heat_auto/
 
 # Local environment/editor noise
 .env
@@ -20,3 +24,6 @@ venv/
 .idea/
 .vscode/
 *.log
+
+# CTM 参考实现（上游 clone，只作参考；需要的部分已 vendored 进 ctm_components.py）
+continuous-thought-machines/
