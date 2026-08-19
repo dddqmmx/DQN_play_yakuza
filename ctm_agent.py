@@ -16,7 +16,8 @@ CTMPlannerAgent：训练 `CTMPlannerNet` 的智能体。
 两个 loss 都按 CTM 的做法跨内部 tick 聚合：取"损失最小的那次思考"和"自认为最
 确定的那次思考"各一半。这一项是让 certainty 变得可信的关键 —— 没有它，
 `pick_most_certain` 挑出来的 tick 就只是个装饰。
-（注意 certainty 只用于挑 tick；提交几步看的是 `CTMPlannerNet.plan_confidence`。）
+（注意 certainty 只用于挑 tick；提交几步看的是逐槽位的
+`CTMPlannerNet.plan_slot_confidence`，不是它取均值后的 `plan_confidence`。）
 """
 from __future__ import annotations
 
@@ -35,7 +36,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from config import CTM_CONFIG, DEVICE, FILE_PATHS, TRAINING_CONFIG
 from ctm_planner import CTMPlannerNet
-from replay_buffer import PrioritizedReplayBuffer, Transition, UniformReplayBuffer
+from replay_buffer import PlanRun, PrioritizedReplayBuffer, Transition, UniformReplayBuffer
 
 ARCH_NAME = "ctm"
 
@@ -73,6 +74,12 @@ class CTMPlannerAgent:
         # 两个 buffer：PER 存 n-step（喂槽位 0 的 TD），均匀 buffer 存 1 步（喂计划一致性）
         self.memory = PrioritizedReplayBuffer(TRAINING_CONFIG["memory_capacity"])
         self.plan_memory = UniformReplayBuffer(int(cfg["plan_memory_capacity"]))
+        # 第三个 buffer：把"一次 commit 里连续执行掉的那一串"整条存下来，
+        # 用来给槽位 j 安一个**真实回报**的锚（见 _flush_plan_run / update_model）
+        self.plan_run_memory = UniformReplayBuffer(int(cfg.get("plan_run_capacity", 2048)))
+        self.plan_run_batch_size = int(cfg.get("plan_run_batch_size", 8))
+        self.plan_return_weight = float(cfg.get("plan_return_weight", 0.5))
+        self._run_pending = []
 
         self.batch_size = int(cfg.get("batch_size", TRAINING_CONFIG["batch_size"]))
         self.plan_batch_size = int(cfg["plan_batch_size"])
@@ -107,7 +114,7 @@ class CTMPlannerAgent:
         # 给日志用的滑动统计
         self._recent_commit = deque(maxlen=200)
         self._recent_confidence = deque(maxlen=200)
-        self.last_losses = {"td": 0.0, "plan": 0.0}
+        self.last_losses = {"td": 0.0, "plan": 0.0, "plan_return": 0.0}
 
     # ------------------------------------------------------------------ 决策
     def select_plan(self, state, boss_health, self_health):
@@ -115,8 +122,8 @@ class CTMPlannerAgent:
         返回 (plan: list[int], commit: int, confidence: float)。
 
         plan 是"从现在起打算做的 L 个动作"，commit 是这次真正提交给游戏的步数。
-        certainty（CTM 的熵）只用于挑 tick；提交长度看的是 `plan_confidence`，
-        原因见 CTMPlannerNet 里那两个方法的注释。
+        certainty（CTM 的熵）只用于挑 tick；提交长度看的是**逐槽位**的
+        `plan_slot_confidence`，原因见 CTMPlannerNet 里那两个方法的注释。
         """
         with torch.no_grad():
             state_t = self._state_tensor(np.asarray(state)[None, ...])
@@ -133,18 +140,28 @@ class CTMPlannerAgent:
 
             picked, _, _ = CTMPlannerNet.pick_most_certain(q_dist_all, certainties)
             plan = picked.mean(-1).argmax(-1)[0].tolist()            # (L,)
-            confidence = CTMPlannerNet.plan_confidence(picked)
-            commit = int(self.policy_net.commit_length(confidence)[0].item())
-            confidence = float(confidence[0].item())
+            slot_conf = CTMPlannerNet.plan_slot_confidence(picked)   # (1, L)
+            commit = int(self.policy_net.commit_length(slot_conf)[0].item())
+            # 报给日志的是整条计划的平均决断度；提交长度用的是逐槽位那个
+            confidence = float(slot_conf.mean(dim=-1)[0].item())
 
         # ε 兜底：NoisyNets 的 sigma 会随训练自己收缩，探索可能悄悄归零。
         # 逐槽位替换成随机动作，保证策略永远不会彻底锁死在一个招式上。
         if self.explore_epsilon > 0:
-            plan = [
-                random.randrange(self.num_actions) if random.random() < self.explore_epsilon
-                else int(a)
-                for a in plan
-            ]
+            first_random = None
+            for i in range(len(plan)):
+                if random.random() < self.explore_epsilon:
+                    plan[i] = random.randrange(self.num_actions)
+                    if first_random is None:
+                        first_random = i
+                else:
+                    plan[i] = int(plan[i])
+            # 被 ε 改写过的槽位，它的决断度已经不作数了 —— 那一步照样执行
+            # （探索的意义就在于执行），但**不能**再拿它后面的槽位继续开环连招，
+            # 所以提交长度截到这一步为止，下一帧重新看画面再规划。
+            # commit 恒为 1 的年代这个交互不存在，改成真会连招后才需要管。
+            if first_random is not None:
+                commit = min(commit, first_random + 1)
 
         self._recent_commit.append(commit)
         self._recent_confidence.append(confidence)
@@ -157,15 +174,26 @@ class CTMPlannerAgent:
 
     # ------------------------------------------------------------------ 存样本
     def store_transition(self, state, boss_health, self_health, action,
-                         reward, next_state, next_boss_health, next_self_health, done):
+                         reward, next_state, next_boss_health, next_self_health, done,
+                         plan_slot=0):
         transition = Transition(
             self._as_state(state), boss_health, self_health, action, reward,
             self._as_state(next_state), next_boss_health, next_self_health, done,
         )
         self.transitions_seen += 1
 
-        # 1 步样本原样进计划 buffer：槽位一致性要的就是"紧邻的下一帧"
-        self.plan_memory.add(transition)
+        # 只有"计划第 0 格"的 1 步样本能进计划 buffer。槽位一致性的目标是
+        #     slot_j(s) ≈ slot_{j-1}^tgt(s')
+        # 这个恒等式要求 s' 是**执行槽位 0** 到达的下一帧。commit > 1 时，中段那些
+        # 样本的 s' 是执行槽位 j 到达的，喂进去等于拿错位的目标去教计划头。
+        # commit 恒为 1 的年代每条样本都来自槽位 0，所以这个字段以前只当诊断信息传；
+        # 现在计划真的会被连着执行，就必须筛。
+        # （n-step 的 PER buffer 不用筛：那边是 Q-learning 的 TD，本来就是 off-policy，
+        #   任何动作的样本都合法。）
+        if plan_slot == 0:
+            self.plan_memory.add(transition)
+
+        self._accumulate_plan_run(transition, plan_slot)
 
         self.n_step_buffer.append(transition)
         if len(self.n_step_buffer) == self.n_step:
@@ -182,6 +210,40 @@ class CTMPlannerAgent:
                 reward_sum, last.next_state, last.next_boss_health,
                 last.next_self_health, last.done,
             ))
+
+    def _accumulate_plan_run(self, transition, plan_slot):
+        """
+        把"一次 commit 里连续执行掉的那几步"拼回一条 run。
+
+        客户端每步都带上 `plan_slot`（这个动作来自计划的第几格），所以 slot 归 0
+        就是一条新计划开始。对不上号（乱序、丢包、中途切换计划）时直接把手里这条
+        丢掉 —— 宁可少喂，也不能拼错：拼错等于给槽位 j 安上别的槽位的回报。
+        """
+        if plan_slot == 0:
+            self._flush_plan_run()
+            self._run_pending = [transition]
+        elif plan_slot == len(self._run_pending):
+            self._run_pending.append(transition)
+        else:
+            self._run_pending = []
+            return
+        if transition.done or len(self._run_pending) >= self.plan_length:
+            self._flush_plan_run()
+
+    def _flush_plan_run(self):
+        """把攒着的那条 run 收进 buffer。只连着走了 1 步的没有意义，丢掉。"""
+        run, self._run_pending = self._run_pending, []
+        # 长度 1 意味着 commit==1（或计划刚开头就被打断），此时没有任何
+        # "槽位 j>0 真的被执行过"的证据可用，锚不了
+        if len(run) < 2:
+            return
+        head, tail = run[0], run[-1]
+        self.plan_run_memory.add(PlanRun(
+            head.state, head.boss_health, head.self_health,
+            tuple(int(t.action) for t in run),
+            tuple(float(t.reward) for t in run),
+            tail.next_state, tail.next_boss_health, tail.next_self_health, tail.done,
+        ))
 
     @staticmethod
     def _as_state(state):
@@ -240,6 +302,36 @@ class CTMPlannerAgent:
         cols = torch.arange(n_slots, device=agree.device).unsqueeze(0)
         return (cols < upto.unsqueeze(1)).float()
 
+    def _plan_run_targets(self, runs):
+        """
+        把一批 run 摊成逐槽位的 (折扣回报, 实际动作, 到 tail 的步数, 掩码)。
+
+        槽位 j 的回报锚 = Σ_{i>=j} γ^(i-j)·r_i + γ^(k-j)·V^tgt(tail)，
+        也就是"从计划的第 j 格起，实际走完这条 run 拿到的东西"。k 是这条 run
+        真正连续执行掉的步数。
+
+        掩码只在 1 <= j < k 上为 1：
+          - j == 0 不用这里锚，它有 PER 的 n-step TD（现成的、带优先级的）；
+          - j >= k 那几格根本没被执行过，没有真实回报可言，仍然交给一致性 loss。
+        """
+        L = self.plan_length
+        n = len(runs)
+        ret = torch.zeros(n, L, dtype=torch.float32)
+        act = torch.zeros(n, L, dtype=torch.long)
+        steps = torch.ones(n, L, dtype=torch.float32)
+        mask = torch.zeros(n, L, dtype=torch.float32)
+        for b, run in enumerate(runs):
+            k = min(len(run.actions), L)
+            acc = 0.0
+            for j in range(k - 1, -1, -1):                     # 从后往前累折扣回报
+                acc = run.rewards[j] * self.reward_scale + self.gamma * acc
+                ret[b, j] = acc
+                act[b, j] = run.actions[j]
+                steps[b, j] = k - j
+                if j >= 1:
+                    mask[b, j] = 1.0
+        return (ret.to(DEVICE), act.to(DEVICE), steps.to(DEVICE), mask.to(DEVICE))
+
     def update_model(self):
         if not self.memory.is_ready(self.batch_size):
             return
@@ -279,6 +371,27 @@ class CTMPlannerAgent:
         else:
             n_td, n_plan = state.size(0), 0
 
+        # 回报锚用的 run 样本（commit 恒为 1 时这个 buffer 永远是空的，loss 为 0）
+        use_runs = (
+            self.plan_length > 1
+            and self.plan_run_batch_size > 0
+            and self.plan_run_memory.is_ready(self.plan_run_batch_size)
+        )
+        if use_runs:
+            runs = self.plan_run_memory.sample(self.plan_run_batch_size)
+            r_state = self._state_tensor([r.state for r in runs])
+            r_boss = torch.as_tensor([[r.boss_health] for r in runs], dtype=torch.float32, device=DEVICE)
+            r_self = torch.as_tensor([[r.self_health] for r in runs], dtype=torch.float32, device=DEVICE)
+            r_tail_state = self._state_tensor([r.tail_state for r in runs])
+            r_tail_boss = torch.as_tensor([[r.tail_boss_health] for r in runs], dtype=torch.float32, device=DEVICE)
+            r_tail_self = torch.as_tensor([[r.tail_self_health] for r in runs], dtype=torch.float32, device=DEVICE)
+            r_done = torch.as_tensor([float(r.done) for r in runs], dtype=torch.float32, device=DEVICE)
+            n_run = r_state.size(0)
+            # 逐槽位的"从第 j 步起到 run 结束"的折扣回报、该步实际动作、到 tail 还差几步
+            r_ret, r_act, r_steps, r_mask = self._plan_run_targets(runs)
+        else:
+            n_run = 0
+
         amp_kwargs = dict(
             device_type=DEVICE.type if DEVICE.type != "cpu" else "cpu",
             dtype=torch.float16,
@@ -290,37 +403,50 @@ class CTMPlannerAgent:
             self.target_net.reset_noise()
 
             with torch.amp.autocast(**amp_kwargs):
-                # --- 一次前向算完两个 batch，省掉重复的 CTM tick 循环 ---
-                if use_plan:
-                    all_q, all_cert = self.policy_net(
-                        torch.cat([state, p_state]),
-                        torch.cat([boss_hp, p_boss]),
-                        torch.cat([self_hp, p_self]),
-                    )
-                    cur_q, cur_cert = all_q[:n_td], all_cert[:n_td]
-                    plan_q, plan_cert = all_q[n_td:], all_cert[n_td:]
-                else:
-                    cur_q, cur_cert = self.policy_net(state, boss_hp, self_hp)
-                    plan_q = plan_cert = None
+                # --- 把几个 batch 拼成一次前向，省掉重复的 CTM tick 循环 ---
+                def _split(t, sizes):
+                    out, i = [], 0
+                    for n in sizes:
+                        out.append(t[i:i + n] if n else None)
+                        i += n
+                    return out
+
+                pol_sizes = [n_td, n_plan, n_run]
+                pol_states = [state] + ([p_state] if use_plan else []) + ([r_state] if use_runs else [])
+                pol_boss = [boss_hp] + ([p_boss] if use_plan else []) + ([r_boss] if use_runs else [])
+                pol_self = [self_hp] + ([p_self] if use_plan else []) + ([r_self] if use_runs else [])
+                all_q, all_cert = self.policy_net(
+                    torch.cat(pol_states), torch.cat(pol_boss), torch.cat(pol_self)
+                )
+                cur_q, plan_q, run_q = _split(all_q, pol_sizes)
+                cur_cert, plan_cert, _ = _split(all_cert, pol_sizes)
 
                 with torch.no_grad():
-                    if use_plan:
-                        tgt_all_q, tgt_all_cert = self.target_net(
-                            torch.cat([next_state, p_next_state]),
-                            torch.cat([next_boss, p_next_boss]),
-                            torch.cat([next_self, p_next_self]),
-                        )
-                        tgt_next, _, _ = CTMPlannerNet.pick_most_certain(tgt_all_q, tgt_all_cert)
-                        tgt_next_td, tgt_next_plan = tgt_next[:n_td], tgt_next[n_td:]
-                    else:
-                        tgt_all_q, tgt_all_cert = self.target_net(next_state, next_boss, next_self)
-                        tgt_next_td, _, _ = CTMPlannerNet.pick_most_certain(tgt_all_q, tgt_all_cert)
-                        tgt_next_plan = None
+                    # target 网络：TD 的 s'、一致性的 s'、以及 run 的尾部状态
+                    tgt_sizes = [n_td, n_plan, n_run]
+                    tgt_states = [next_state] + ([p_next_state] if use_plan else []) + \
+                                 ([r_tail_state] if use_runs else [])
+                    tgt_boss = [next_boss] + ([p_next_boss] if use_plan else []) + \
+                               ([r_tail_boss] if use_runs else [])
+                    tgt_self = [next_self] + ([p_next_self] if use_plan else []) + \
+                               ([r_tail_self] if use_runs else [])
+                    tgt_all_q, tgt_all_cert = self.target_net(
+                        torch.cat(tgt_states), torch.cat(tgt_boss), torch.cat(tgt_self)
+                    )
+                    tgt_next, _, _ = CTMPlannerNet.pick_most_certain(tgt_all_q, tgt_all_cert)
+                    tgt_next_td, tgt_next_plan, tgt_tail = _split(tgt_next, tgt_sizes)
 
                     # Double DQN：动作由 policy 选、价值由 target 给
-                    pol_next_q, pol_next_cert = self.policy_net(next_state, next_boss, next_self)
+                    pn_sizes = [n_td, n_run]
+                    pn_states = [next_state] + ([r_tail_state] if use_runs else [])
+                    pn_boss = [next_boss] + ([r_tail_boss] if use_runs else [])
+                    pn_self = [next_self] + ([r_tail_self] if use_runs else [])
+                    pol_next_q, pol_next_cert = self.policy_net(
+                        torch.cat(pn_states), torch.cat(pn_boss), torch.cat(pn_self)
+                    )
                     pol_next, _, _ = CTMPlannerNet.pick_most_certain(pol_next_q, pol_next_cert)
-                    next_action = pol_next[:, 0].mean(-1).argmax(-1)                  # (B,)
+                    pol_next_td, pol_next_tail = _split(pol_next, pn_sizes)
+                    next_action = pol_next_td[:, 0].mean(-1).argmax(-1)                # (B,)
 
             # ---------------- 槽位 0：标准 QR-DQN TD ----------------
             next_quantiles = tgt_next_td[:, 0].gather(
@@ -385,7 +511,44 @@ class CTMPlannerAgent:
                 keep = 1.0 - p_done
                 plan_loss = (plan_per_sample * keep).sum() / keep.sum().clamp(min=1.0)
 
-            loss = td_loss + self.plan_loss_weight * plan_loss
+            # ------------- 槽位 1..k-1：真实回报锚（"照计划走"才有收益的来源） -------------
+            # 一致性 loss 只保证槽位之间自洽，没有奖励信号进得去；这一项把**真的连续
+            # 执行掉的**那几步的折扣回报直接安到对应槽位上，于是"计划值不值得照着走"
+            # 由真实回报说了算，而不是自指。
+            plan_return_loss = torch.zeros((), device=DEVICE)
+            if use_runs:
+                # 尾部自举（Double DQN，和槽位 0 的 TD 同构）
+                tail_act = pol_next_tail[:, 0].mean(-1).argmax(-1)                     # (B,)
+                tail_quantiles = tgt_tail[:, 0].gather(
+                    1, tail_act.view(-1, 1, 1).expand(-1, 1, self.num_quantiles)
+                ).squeeze(1)                                                          # (B, Q)
+                run_losses = []
+                for j in range(1, self.plan_length):
+                    if float(r_mask[:, j].sum()) == 0:
+                        continue
+                    disc = (1.0 - r_done) * torch.pow(self.gamma, r_steps[:, j])       # (B,)
+                    tgt_j = r_ret[:, j].unsqueeze(1) + disc.unsqueeze(1) * tail_quantiles
+                    a_idx = r_act[:, j].view(-1, 1, 1, 1).expand(
+                        -1, 1, self.num_quantiles, n_ticks
+                    )
+                    cur_j = run_q[:, j].gather(1, a_idx).squeeze(1)                    # (B, Q, T)
+                    per_tick = torch.stack([
+                        self._quantile_huber(cur_j[..., t], tgt_j) for t in range(n_ticks)
+                    ], dim=1)                                                          # (B, T)
+                    run_losses.append(per_tick * r_mask[:, j].unsqueeze(1))
+                if run_losses:
+                    # 每个样本按它真正执行掉的槽位数取平均
+                    stacked = torch.stack(run_losses, dim=1).sum(dim=1)                # (B, T)
+                    denom = r_mask[:, 1:].sum(dim=1, keepdim=True).clamp(min=1.0)
+                    run_cert = all_cert[n_td + n_plan:]
+                    per_sample = self._ctm_tick_aggregate(stacked / denom, run_cert)
+                    plan_return_loss = per_sample.mean()
+
+            loss = (
+                td_loss
+                + self.plan_loss_weight * plan_loss
+                + self.plan_return_weight * plan_return_loss
+            )
 
             self.optimizer.zero_grad(set_to_none=True)
             self.scaler.scale(loss).backward()
@@ -407,10 +570,19 @@ class CTMPlannerAgent:
             self.last_losses = {
                 "td": float(td_loss.detach()),
                 "plan": float(plan_loss.detach()),
+                "plan_return": float(plan_return_loss.detach()),
             }
             if self.steps % 100 == 0:
                 self.writer.add_scalar("Loss/TD", self.last_losses["td"], self.steps)
                 self.writer.add_scalar("Loss/Plan", self.last_losses["plan"], self.steps)
+                self.writer.add_scalar(
+                    "Loss/PlanReturn", self.last_losses["plan_return"], self.steps
+                )
+                # 这条是回报锚有没有在工作的**总开关**：commit 恒为 1 时它永远是 0，
+                # 说明计划从没被连着执行过，锚也就无从谈起。
+                self.writer.add_scalar(
+                    "Plan/RunBuffer", len(self.plan_run_memory), self.steps
+                )
                 self.writer.add_scalar(
                     "Plan/CertainTick", cur_cert[:, 1].argmax(-1).float().mean().item(), self.steps
                 )

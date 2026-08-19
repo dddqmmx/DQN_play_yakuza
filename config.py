@@ -20,6 +20,11 @@ GAME_CONFIG = {
     'num_actions': 13,
     # 计划执行途中挨打超过这个血量比例，立刻丢弃剩余计划重新规划
     'plan_interrupt_damage': 0.01,
+    # 连续这么多帧都判"血量回升"，就认定失真的是基线而不是当前帧，强制重新同步。
+    # 守卫只拦上升、不拦下降，是个单向棘轮：偏低的异常读数会被当成"打出伤害"
+    # 照单全收并成为新基线，此后每一帧正常读数都比它高、永远被拒。
+    # 实测一次死锁 176 帧、期间一条样本都不产生（见 core/game_loop.py 主循环）。
+    'health_regen_resync_after': 3,
     # 血条自动定位：默认开；DQN_AUTO_LOCATE=0 可关
     'auto_locate': _os.environ.get("DQN_AUTO_LOCATE", "1").lower() not in ("0", "false", "no"),
 }
@@ -125,11 +130,29 @@ CTM_CONFIG = {
     'plan_memory_capacity': 4096,      # 1 步 transition 环形 buffer（喂一致性 loss）
     'plan_batch_size': 16,
 
+    # --- 计划回报锚（让槽位 j 对真实的 j 步回报负责）---
+    # 纯自举的一致性 loss 只保证"槽位之间自洽"，没有任何奖励信号进得去，实测
+    # 6145 步后槽位 1~3 在真实画面上的决断度只有 0.116/0.111/0.083，低于"毫无
+    # 偏好"的 0.145 —— 被回归成了一摊糊。所以额外拿**真的连续执行掉的那几步**
+    # 的折扣回报去锚：槽位 j 的目标 = 从第 j 步起的实际回报 + 尾部自举。
+    #
+    # 只有 commit >= 2 才会产生这种样本，所以它天然是个自举课程：
+    # 槽位 0 稳 -> commit 2 -> 槽位 1 拿到真实回报 -> commit 3 -> ……逐格向外长。
+    # 训练早期这个 buffer 是空的，loss 为 0，不影响原有两项。
+    'plan_run_capacity': 2048,
+    'plan_run_batch_size': 8,
+    'plan_return_weight': 0.5,         # 回报锚 loss 的权重
+
     # --- 提交长度（计划的决断程度 -> 提交几步）---
-    # 阈值作用在 `CTMPlannerNet.plan_confidence` 的相对动作间隔上，尺度无关：
-    # 13 个动作毫无偏好时该值恒在 ≈0.147，所以 lo 取 0.20 表示"确实有偏好了才连招"。
-    'commit_confidence_lo': 0.20,  # 低于此只提交 1 步
-    'commit_confidence_hi': 0.60,  # 高于此提交满 plan_length 步
+    # 阈值**逐槽位**作用在 `CTMPlannerNet.plan_slot_confidence` 的相对动作间隔上，
+    # 尺度无关。单槽位标定（13 个动作）：无偏好 ≈0.145、最优高出 2σ ≈0.199、
+    # 3σ ≈0.298、10σ ≈0.719。取 0.20 表示"这一步确实有偏好了才往下连"。
+    # commit = 从槽位 0 起连续过线的槽位个数，详见 CTMPlannerNet.commit_length。
+    #
+    # 原来还有个 `commit_confidence_hi: 0.60` 配合线性映射用，已删除：0.60 对应
+    # 单槽位约 7σ 的动作间隔，实际训练根本到不了，配上 round() 后连 2 步都要
+    # 0.267，结果 commit 恒为 1、整条计划只有第 0 格被执行。
+    'commit_confidence_lo': 0.20,  # 逐槽位：低于此就在这一步截断，不再往下连
 }
 
 CTM_PROFILES = {

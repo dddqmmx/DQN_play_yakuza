@@ -69,6 +69,9 @@ HEAT_MIN_FRAC = 0.15
 REPAIR_UNTIL_GOOD_READS = 60   # 连续读出这么多次有效血量后冻结轨道，不再修
 REPAIR_MARGIN_RATIO = 0.08     # 单侧单次最多外扩轨道宽度的这个比例
 
+# 找"已损失区"时，轨道最右端允许有 宽度/这个数 列不是已损失色（见 _trailing_run）
+TRAILING_TAIL_TOL_RATIO = 64
+
 # 已损失部分（正常）：纯黑。留余量给压缩/缩放噪声和紫色脉动最暗的一相。
 BLACK_MAX = 14
 
@@ -317,15 +320,29 @@ def _leading_run(flags: np.ndarray, gap_tol: int = 4) -> int:
     return end
 
 
-def _trailing_run(flags: np.ndarray, gap_tol: int = 2) -> int:
-    """从右端起的连续 True 长度。"""
+def _trailing_run(flags: np.ndarray, gap_tol: int = 2, tail_tol: Optional[int] = None) -> int:
+    """
+    从右端起的连续 True 长度（= n - 最左那个 True 的列号，含末尾被顶掉的几列）。
+
+    `tail_tol` 是**锚点**允许离右端多远。轨道最尽头那几列很不可靠：Boss 条右端
+    是金色端帽 + 半透明底，背景一亮就把它们顶出纯黑判据（实测末列 max(BGR)
+    在 0 和 196 之间跳，而 BLACK_MAX 才 14）。旧实现只认最后 3 列，一被顶掉
+    就整段已损失区都锚不住、返回 0。
+
+    这个容差是 `measure_fill` 敢把 `empty_run == 0` 解释成"没有已损失区"的前提：
+    两者必须一起改。只删 measure_fill 里的分支而不放宽这里，被顶亮的末列就会
+    冒充"满血"——实测把最右 3 列涂灰重跑样本，真值 39% 的帧读成 67%。
+    """
     n = len(flags)
     if n == 0:
         return 0
+    if tail_tol is None:
+        tail_tol = max(3, n // TRAILING_TAIL_TOL_RATIO)
+    floor = max(n - 1 - tail_tol, 0)
     start = n - 1
-    while start > max(n - 4, -1) and not flags[start]:
+    while start > floor and not flags[start]:
         start -= 1
-    if start <= max(n - 4, -1):
+    if not flags[start]:
         return 0
     count = 0
     gap = 0
@@ -419,6 +436,9 @@ def measure_fill(frame: np.ndarray, box: BarBox) -> BarReading:
 
     fill_run = _leading_run(filled, gap_tol=heat_gap_tol if heat_on else gap_tol)
     empty_run = _trailing_run(cls["empty"])
+    # 读不到已损失区（empty_run == 0）意味着它起始于轨道尽头**之后** ——
+    # 前沿高亮把剩下那点已损失区整个盖住了。所以 width 才是它的起点。
+    empty_start = width - empty_run
 
     # --- 空血条 ---
     if fill_run == 0:
@@ -448,17 +468,25 @@ def measure_fill(frame: np.ndarray, box: BarBox) -> BarReading:
         # 血量回升的垃圾样本）。
         if empty_run == 0:
             return BarReading(None, heat_frac, f"heat-saturated({heat_frac:.2f})")
-        empty_start = width - empty_run
         # 容差按边界渐变的实测宽度给：热血色会往已损失区糊进去十来列
         # （362 宽的玩家条上实测重叠 11 列 ≈ 3%），那是渐变不是矛盾。
         if fill_run > empty_start + max(8, width // 25):
             return BarReading(None, heat_frac, "heat-inconsistent")
 
-    edge = float(fill_run)
-    if empty_run > 0:
-        empty_start = width - empty_run
-        if empty_start >= fill_run:
-            edge = 0.5 * (fill_run + empty_start)
+    # 血量边界取"最后一个填充列"和"已损失区起点"的中点 —— 两者之间是前沿高亮，
+    # 取中点最接近真实值。
+    #
+    # 这里**不能**因为 empty_run == 0 就退回 `edge = fill_run`：那是前沿高亮带的
+    # 左端，和中点差着半个高亮带宽（Boss 条实测带宽中位 49px -> 24.5px = 3.8% 血量），
+    # 比 health_regen_tolerance(0.02 = 12.9px) 还大一倍。而血量一过 92%，
+    # 前沿高亮就把剩下的已损失区整个盖住（轨内 empty 列数实测只剩 0~2 列），
+    # empty_run 是否为 0 全看末列有没有跨过 BLACK_MAX —— 于是同一个血量在两套
+    # 公式之间来回跳，被上层当成"血量回升"垃圾帧。实测 338 行日志里 254 行
+    # （75%）是这么来的，吞吐从 8.2 步/s 掉到 2.2。
+    #
+    # 用同一套公式一路算到底就没有这个跳变：满血时 fill_run == empty_start == width，
+    # 中点仍然是 width。
+    edge = 0.5 * (fill_run + empty_start) if empty_start >= fill_run else float(fill_run)
     ratio = float(np.clip(edge / width, 0.0, 1.0))
     conf = float(np.clip(0.6 * head_purity + 0.4 * covered, 0.0, 1.0))
     return BarReading(ratio, conf, "heat-ok" if heat_on else "ok")

@@ -9,7 +9,9 @@ CTMPlannerNet：输出**动作序列**的 Continuous Thought Machine。
 
 `j` 是"从现在起第 j 步"，所以 argmax 出来的 (a_0, a_1, ..., a_{L-1}) 就是模型
 自己规划的连招。计划不是承诺：下一次决策会重新规划，可以推翻上一次的主意，
-提交多少步由这条计划的决断程度决定（见 `plan_confidence` / `commit_length`）。
+提交多少步由**逐槽位**的决断程度决定（见 `plan_slot_confidence` / `commit_length`）。
+`plan_confidence`（整条计划取均值）只作日志用 —— 拿它去定提交长度会让 commit
+恒等于 1，整条计划只有第 0 格被执行，原委见 `commit_length` 的注释。
 
 CTM 的四个要素都在 `forward` 的那个 tick 循环里：
   1. 内部递归      —— 同一帧画面上"想" iterations 次
@@ -281,26 +283,46 @@ class CTMPlannerNet(nn.Module):
         它**不能**跨状态/跨训练阶段比较：熵由 Q 的绝对尺度主导，而 Q 的尺度是
         奖励量纲、会随训练不断变大——实测 σ=2.0 的纯随机 Q 能得到 0.42 的
         "certainty"，而 σ=0.3 下真正决断的 Q 只有 0.03。提交长度因此不能用它，
-        见 `plan_confidence`。
+        见 `plan_slot_confidence`。
         """
         entropy = compute_normalized_entropy(q_dist.mean(-1), reduction="mean")
         return torch.stack([entropy, 1.0 - entropy], dim=-1)
 
     @staticmethod
-    def plan_confidence(q_dist):
+    def plan_slot_confidence(q_dist):
         """
-        (B, L, A, Q) -> (B,)：这条计划有多决断，用来决定提交几步。
+        (B, L, A, Q) -> (B, L)：**逐槽位**的决断程度。提交几步就看它。
 
-        用**相对动作间隔** = (最优 Q - 次优 Q) / (最优 Q - 最差 Q)，逐槽位算完取
-        均值。它衡量的是"最优动作比替代方案好多少"，对 Q 的绝对尺度免疫：
-        13 个动作毫无偏好时恒定在 ≈0.147（与 Q 的 σ 无关），最优动作高出 3σ 时
-        ≈0.30，高出 10σ 时 ≈0.72。所以固定阈值在整个训练期都成立。
+        用**相对动作间隔** = (最优 Q - 次优 Q) / (最优 Q - 最差 Q)。它衡量的是
+        "最优动作比替代方案好多少"，对 Q 的绝对尺度免疫，所以固定阈值在整个训练期
+        都成立。单个槽位、13 个动作下的实测标定：毫无偏好 ≈0.145，最优高出 2σ
+        ≈0.199，3σ ≈0.298，10σ ≈0.719。
+
+        **不要在这里取均值再判阈值**（原来的做法），有两个致命后果：
+          1. 槽位 3 决断不决断，和"能不能安全提交 2 步"毫无关系，取均值却让它一票
+             同权。而越靠后的槽位只由自举一致性训练、天生更平滑：6145 步的
+             ctm_planner_small.pth 在 378 帧真实画面上实测逐槽位均值
+             0.287 / 0.116 / 0.111 / 0.083 —— 后三格甚至低于"毫无偏好"的 0.145，
+             于是恰恰是最没学好的槽位在否决连招。
+          2. 取均值会把动态范围压没：无偏好时单槽位 p99 能到 0.467，4 槽取均值后
+             p99.9 只剩 0.347，而阈值是按单槽位尺度标的。
         """
         q = q_dist.mean(-1)                                   # (B, L, A)
         top2 = q.topk(2, dim=-1).values
         gap = top2[..., 0] - top2[..., 1]
         spread = q.max(dim=-1).values - q.min(dim=-1).values
-        return (gap / (spread + 1e-6)).mean(dim=-1)
+        return gap / (spread + 1e-6)                          # (B, L)
+
+    @staticmethod
+    def plan_confidence(q_dist):
+        """
+        (B, L, A, Q) -> (B,)：整条计划的平均决断程度，**只用于日志/监控**
+        （tensorboard 的 `Plan/Confidence`）。
+
+        提交长度不要用它 —— 用 `plan_slot_confidence` + `commit_length`，
+        原因见前者的注释。
+        """
+        return CTMPlannerNet.plan_slot_confidence(q_dist).mean(dim=-1)
 
     def forward(self, x, boss_health, self_health, track=False):
         b = x.size(0)
@@ -377,21 +399,39 @@ class CTMPlannerNet(nn.Module):
         certainty = certainties[:, 1].gather(-1, tick.unsqueeze(-1)).squeeze(-1)
         return picked, certainty, tick
 
-    def commit_length(self, confidence):
+    def commit_length(self, slot_confidence):
         """
-        计划的决断程度 -> 提交几步。有把握就把整条连招打完，没把握就走一步看一步。
+        逐槽位决断程度 (B, L) -> 提交几步 (B,)。
 
-        阈值作用在 `plan_confidence` 上（尺度无关）：默认 lo 略高于"毫无偏好"的
-        基线 0.147，所以模型真的分不清好坏时只提交 1 步。若 tensorboard 里
-        `Plan/Confidence` 长期贴着 0.15、`Plan/CommitLen` 恒为 1，说明计划头还没
-        学出偏好，不是这里的阈值设错了。
+        规则：从槽位 0 往后数，**数到第一个不够决断的槽位为止**。也就是
+        "对下一步有把握就接着打，哪一步没底就停下来重新看画面"。至少提交 1 步，
+        否则一帧都推进不了。
+
+        原来的做法是先把 L 个槽位的决断度平均成一个数，再线性映射到 [1, L]：
+
+            k = round(1 + clamp((conf - lo) / (hi - lo), 0, 1) * (L - 1))
+
+        三个毛病叠起来让 commit **恒等于 1**，整条计划只有第 0 格被执行过
+        （1600 步训练日志里 32/32 条 Step 行都是"提交1 均提交1.0 中断0"；
+        6145 步的 checkpoint 在 378 帧真实画面上重放，378/378 也都只提交 1 步）：
+
+          1. 平均把最没学好的后段槽位与槽位 0 等同看待（见 plan_slot_confidence）；
+          2. 阈值按单槽位尺度标定却作用在均值上，两者动态范围不匹配；
+          3. round() 让标称的 lo 形同虚设 —— L=4 时要 conf ≥ lo + (hi-lo)/6 = 0.267
+             才够 2 步；而 hi=0.60 对应单槽位约 7σ 的间隔，训练里根本到不了，
+             所以 commit=L 是死代码。
+
+        现在阈值直接作用在它被标定的那个尺度上，也没有 round 带来的死区。
         """
-        lo = float(self.config["commit_confidence_lo"])
-        hi = float(self.config["commit_confidence_hi"])
-        span = max(hi - lo, 1e-6)
-        ratio = torch.clamp((confidence - lo) / span, 0.0, 1.0)
-        k = torch.round(1 + ratio * (self.plan_length - 1))
-        return torch.clamp(k, 1, self.plan_length).long()
+        if slot_confidence.dim() != 2:
+            raise ValueError(
+                f"commit_length 要 (B, L) 的逐槽位决断度，收到 {tuple(slot_confidence.shape)}；"
+                "整条计划的均值（plan_confidence）只能用于日志"
+            )
+        decisive = slot_confidence >= float(self.config["commit_confidence_lo"])
+        # 前缀长度 = 从左起连续 True 的个数：cumprod 一碰到 False 就永久归零
+        k = decisive.long().cumprod(dim=-1).sum(dim=-1)
+        return k.clamp(1, self.plan_length).long()
 
     def reset_noise(self):
         if self.explore_head is not None:

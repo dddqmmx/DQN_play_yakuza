@@ -346,16 +346,35 @@ class GameObservation:
 
         return penalty
 
+    def is_health_regen(self, prev_self, prev_boss, curr_self, curr_boss) -> bool:
+        """
+        血量回升 = 这一帧不可信。战斗中血量只降不升，读到回升就是检测噪声。
+
+        判据放在这里是因为两个训练循环（core/game_loop.py 与 training_manager.py）
+        都要用它，而且必须在**算奖励之前**判 —— 一旦漏进去，`damage_dealt` 会把
+        检测噪声当成真伤害记分，而伤害是唯一的主奖励信号。
+
+        注意它**只拦上升、不拦下降**，所以天然是个单向棘轮：偏低的异常读数会被
+        当成"打出伤害"照单全收并成为新基线，此后每一帧正常读数都比它高、永远被拒。
+        所以调用方拒帧后**必须**推进或重新同步基线，不能原地空转
+        —— 实测一次死锁 176 帧，期间照常按键却一条样本都不产生。
+        """
+        tol = REWARD_CONFIG.get("health_regen_tolerance", 1e-6)
+        return curr_boss > prev_boss + tol or curr_self > prev_self + tol
+
     def calculate_reward(self, prev_self, prev_boss, curr_self, curr_boss, action):
+        """
+        调用前提：调用方**已经**用 `is_health_regen()` 拦掉了血量回升的帧。
+
+        这个判据以前在这里又抄了一份、靠返回 None 来拒帧，但 core/game_loop.py
+        在调用前就用同一个容差判过一遍，那份永远命中不了（实测 338 行日志里
+        ">> 奖励函数拒绝垃圾帧" 出现 0 次），只会让人以为多了一道保险。
+        """
         now = time.time()
         dt = now - self.last_step_time
         if dt > 1.0:
             dt = 1.0
         self.last_step_time = now
-
-        regen_tolerance = REWARD_CONFIG.get("health_regen_tolerance", 1e-6)
-        if curr_boss > prev_boss + regen_tolerance or curr_self > prev_self + regen_tolerance:
-            return None
 
         damage_dealt = max(0.0, prev_boss - curr_boss)
         damage_taken = max(0.0, prev_self - curr_self)

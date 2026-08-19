@@ -15,7 +15,7 @@ import threading
 import time
 from typing import Optional
 
-from config import GAME_CONFIG, REWARD_CONFIG
+from config import GAME_CONFIG
 from core.actions import ActionController
 from core.client import DecisionClient
 from core.interfaces import PlatformBundle, ProcessControlBackend
@@ -44,6 +44,11 @@ class GameClient:
         self.action_controller = ActionController(platform.input)
         # 计划执行途中挨打超过这个幅度就丢弃剩余计划、立刻重规划
         self.plan_interrupt_damage = float(GAME_CONFIG.get("plan_interrupt_damage", 0.01))
+        # 连续这么多帧判"血量回升"就重新同步基线，避免单向棘轮把循环卡死
+        self.regen_resync_after = max(
+            1, int(GAME_CONFIG.get("health_regen_resync_after", 3))
+        )
+        self._regen_streak = 0
         self.freezer: Optional[ProcessControlBackend] = None
         if freeze_process:
             self.freezer = platform.process_factory(
@@ -160,8 +165,8 @@ class GameClient:
 
     # ---- 步进辅助 ----
     def _is_invalid_health_transition(self, prev_self, prev_boss, curr_self, curr_boss):
-        tolerance = REWARD_CONFIG.get("health_regen_tolerance", 1e-6)
-        return curr_boss > prev_boss + tolerance or curr_self > prev_self + tolerance
+        # 判据本身在 GameObservation 里，training_manager.py 用的是同一个
+        return self.game.is_health_regen(prev_self, prev_boss, curr_self, curr_boss)
 
     def _read_settled(self, attempts: int = 3, delay: float = 0.05):
         """
@@ -192,6 +197,8 @@ class GameClient:
         等待可信血条。期间若画面几乎全黑（玩家死亡/结算/读盘），
         持续按回车推进 —— 否则血条永远读不到，循环会一直空转。
         """
+        # 本函数返回的血量就是新基线，之前攒的"连续回升"计数与它无关
+        self._regen_streak = 0
         last_log = 0.0
         last_enter = 0.0
         black_since = None
@@ -333,21 +340,38 @@ class GameClient:
                     if self._is_invalid_health_transition(
                         self_hp, boss_hp, next_self_hp, next_boss_hp
                     ):
-                        print(
-                            ">> 检测到血量回升垃圾帧，已跳过 | "
-                            f"boss {boss_hp:.4f}->{next_boss_hp:.4f}, "
-                            f"self {self_hp:.4f}->{next_self_hp:.4f}"
-                        )
-                        time.sleep(1.0 / max(self.target_fps, 1.0))
+                        # 这个守卫只拦上升、不拦下降，所以它是个**单向棘轮**：
+                        # 偏低的异常读数会被当成"打出伤害"照单全收并成为新基线，
+                        # 此后每一帧正常读数都比它高、永远被拒。若这里只 break 而不
+                        # 推进基线，循环就原地空转 —— 期间 take_action() 照常按键、
+                        # state 冻结、一条样本都不产生。实测单次死锁 176 帧，
+                        # 玩家血量从 0.983 掉到 0.605 却只有 5% 被记进"挨打"。
+                        # 所以：连续 N 帧都"回升"就不是单帧噪声，而是基线本身失真。
+                        self._regen_streak += 1
+                        resync = self._regen_streak >= self.regen_resync_after
+                        if self._regen_streak == 1 or resync:
+                            print(
+                                ">> 检测到血量回升垃圾帧，"
+                                + ("基线失真已重新同步" if resync else "已跳过")
+                                + f"（连续{self._regen_streak}帧）| "
+                                f"boss {boss_hp:.4f}->{next_boss_hp:.4f}, "
+                                f"self {self_hp:.4f}->{next_self_hp:.4f}"
+                            )
+                        if resync:
+                            # 采信当前读数重新起步，但**不产生样本** ——
+                            # 这一段的真实血量增量无从得知，硬编一个只会污染 buffer。
+                            boss_hp, self_hp = next_boss_hp, next_self_hp
+                            state = self.game.get_state_from_frame(next_raw)
+                            self._regen_streak = 0
+                        else:
+                            time.sleep(1.0 / max(self.target_fps, 1.0))
                         break
 
+                    self._regen_streak = 0
                     next_state = self.game.get_state_from_frame(next_raw)
                     reward = self.game.calculate_reward(
                         self_hp, boss_hp, next_self_hp, next_boss_hp, action
                     )
-                    if reward is None:
-                        print(">> 奖励函数拒绝垃圾帧，已跳过")
-                        break
                     done = next_self_hp <= 0 or next_boss_hp <= 0
 
                     self.decision.send_transition({
@@ -360,7 +384,8 @@ class GameClient:
                         "next_boss_health": next_boss_hp,
                         "next_self_health": next_self_hp,
                         "done": done,
-                        # 只作诊断用：AI 节点存样本时不区分动作来自计划的第几格
+                        # 这个动作来自计划的第几格。计划一致性 loss 只能吃第 0 格
+                        # 的样本（见 CTMPlannerAgent.store_transition），不只是诊断用。
                         "plan_slot": slot,
                     })
 

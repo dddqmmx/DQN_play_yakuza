@@ -8,6 +8,16 @@ Transition = namedtuple('Transition',
                          'reward', 'next_state', 'next_boss_health',
                          'next_self_health', 'done'))
 
+# 一次 commit 里**连续执行掉的那一串**。用来把计划槽位锚到真实回报上：
+# 槽位 j 的目标 = 从第 j 步起到这条 run 结束的折扣回报 + 尾部自举。
+#
+# 只存首尾两个画面（head 用来前向，tail 用来自举），中间步只留动作和奖励 ——
+# 每条 run 的内存开销因此和一条普通 transition 一样，而不是随 run 长度线性涨。
+PlanRun = namedtuple('PlanRun',
+                     ('state', 'boss_health', 'self_health',
+                      'actions', 'rewards',
+                      'tail_state', 'tail_boss_health', 'tail_self_health', 'done'))
+
 class SumTree:
     """SumTree for prioritized sampling (Thread-safe)"""
     def __init__(self, capacity):

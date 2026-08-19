@@ -122,7 +122,11 @@ class DQNAgent:
                         return q_values.argmax().item()
 
     def store_transition(self, state, boss_health, self_health, action,
-                         reward, next_state, next_boss_health, next_self_health, done):
+                         reward, next_state, next_boss_health, next_self_health, done,
+                         plan_slot=0):
+        # plan_slot 只有计划模型（CTMPlannerAgent）用得上，这里收下并忽略，
+        # 好让 decision_node 对两种 agent 用同一个调用。
+        del plan_slot
         transition = Transition(
             state.copy() if hasattr(state, 'copy') else state, 
             boss_health, self_health, action,

@@ -171,6 +171,9 @@ class DecisionNode:
             msg["state"], msg["boss_health"], msg["self_health"], msg["action"],
             msg["reward"], msg["next_state"], msg["next_boss_health"],
             msg["next_self_health"], msg["done"],
+            # 这个动作来自计划的第几格。计划一致性 loss 只能吃第 0 格的样本
+            # （见 CTMPlannerAgent.store_transition），所以必须传下去。
+            plan_slot=int(msg.get("plan_slot", 0)),
         )
 
     def _save(self, filename=None):

@@ -104,6 +104,11 @@ class TrainingManager:
         self.agent = self._create_agent(model_profile)
         self.damage_stats = DamageStats()
         self.plan_interrupt_damage = float(GAME_CONFIG.get("plan_interrupt_damage", 0.01))
+        # 连续这么多帧判"血量回升"就重新同步基线（见 GameObservation.is_health_regen）
+        self.regen_resync_after = max(
+            1, int(GAME_CONFIG.get("health_regen_resync_after", 3))
+        )
+        self._regen_streak = 0
 
         # 状态控制
         self.is_paused = True
@@ -240,6 +245,7 @@ class TrainingManager:
         # 优化：利用 check_game_state 已经拿到的 raw screen
         state = self.game.get_state_from_frame(raw)
         self.game.reset_reward_stats() # 重置本回合的奖励统计数据
+        self._regen_streak = 0         # 新回合的基线是刚读到的，与上回合的计数无关
         self.episode_count += 1
         hidden = None
         
@@ -271,15 +277,40 @@ class TrainingManager:
 
                 next_state = self.game.get_state_from_frame(next_raw)
 
-                # 5. 计算奖励
+                # 5. 血量回升的帧不可信，必须在算奖励之前拦掉 ——
+                #    漏进去就会把检测噪声当成真伤害记分。
+                #    但拒帧后只 break 而不推进基线会死锁（判据只拦上升不拦下降，
+                #    偏低的异常读数一旦成为基线，之后每帧正常读数都被判回升）。
+                if self.game.is_health_regen(
+                    self_hp, boss_hp, next_self_hp, next_boss_hp
+                ):
+                    self._regen_streak += 1
+                    resync = self._regen_streak >= self.regen_resync_after
+                    if self._regen_streak == 1 or resync:
+                        print(
+                            ">> 检测到血量回升垃圾帧，"
+                            + ("基线失真已重新同步" if resync else "已跳过")
+                            + f"（连续{self._regen_streak}帧）| "
+                            f"boss {boss_hp:.4f}->{next_boss_hp:.4f}, "
+                            f"self {self_hp:.4f}->{next_self_hp:.4f}"
+                        )
+                    if resync:
+                        # 采信当前读数重新起步，但**不产生样本** ——
+                        # 这一段的真实血量增量无从得知，硬编一个只会污染 buffer
+                        boss_hp, self_hp = next_boss_hp, next_self_hp
+                        state = next_state
+                        self._regen_streak = 0
+                    break
+
+                self._regen_streak = 0
+
+                # 6. 计算奖励
                 reward = self.game.calculate_reward(
                     self_hp, boss_hp, next_self_hp, next_boss_hp, action
                 )
-                if reward is None:
-                    break
                 done = next_self_hp <= 0 or next_boss_hp <= 0
 
-                # 5.1 表现评估 (仅在回合结束时计算一次)
+                # 6.1 表现评估 (仅在回合结束时计算一次)
                 if done:
                     episode_duration = time.time() - episode_start_time
                     total_damage = max(0, boss_hp_start - next_boss_hp)
@@ -290,13 +321,14 @@ class TrainingManager:
                         print(f">> {msg}")
                     reward += perf_reward
 
-                # 6. 存储经验
+                # 7. 存储经验
                 self.agent.store_transition(
                     state, boss_hp, self_hp, action,
-                    reward, next_state, next_boss_hp, next_self_hp, done
+                    reward, next_state, next_boss_hp, next_self_hp, done,
+                    plan_slot=slot,
                 )
 
-                # 7. 更新当前状态
+                # 8. 更新当前状态
                 took = max(0.0, self_hp - next_self_hp)
                 state = next_state
                 boss_hp = next_boss_hp
